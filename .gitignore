@@ -1,0 +1,25 @@
+# Dependencies and build output
+node_modules/
+cdk.out/
+*.js
+!jest.config.js
+*.d.ts
+
+# CDK: account-specific lookups (AZs, VPC ids) cached on each machine
+cdk.context.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets and keys: never committed
+.env
+.env.*
+*.pem
+
+# Editors, OS and logs
+.idea/
+.vscode/
+.DS_Store
+*.log

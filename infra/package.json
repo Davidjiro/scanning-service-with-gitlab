@@ -1,0 +1,21 @@
+{
+  "name": "orderflow-infra",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CDK (TypeScript) infrastructure deployed by GitLab CI/CD",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "synth": "cdk synth",
+    "test": "echo \"no tests\""
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.276.0",
+    "constructs": "10.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "aws-cdk": "2.1148.1",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}

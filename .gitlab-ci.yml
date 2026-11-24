@@ -1,0 +1,197 @@
+# =============================================================================
+#  GitLab CI/CD pipeline: dev -> qa -> prod, one AWS account per environment
+# =============================================================================
+#
+#   validate ──► dev ──► qa ──► prod
+#                 │       │       │
+#     (auto)  deploy → smoke  [manual gate] deploy → smoke  [manual gate] deploy → health
+#
+#   Merge request:   validate + `cdk diff` against dev (read-only preview). Nothing is deployed.
+#   Default branch:  validate, deploy dev + smoke test automatically; qa and prod wait for a human.
+#
+# AUTHENTICATION: no AWS keys are stored in GitLab. Each job gets a short-lived OIDC ID token and
+# trades it for temporary credentials of the account's `orderflow-<env>-gitlab-deploy` role (ci/aws-auth.sh).
+# One-time setup per account: see README section 7.
+#
+# CI/CD VARIABLES to define (Settings > CI/CD > Variables). None is a secret credential:
+#   AWS_ROLE_ARN_DEV / AWS_ROLE_ARN_QA / AWS_ROLE_ARN_PROD   DeployRoleArn output of orderflow-<env>-gitlab-access
+#   CDK_DEFAULT_REGION     (optional, default us-east-1)
+#   EKS_ADMIN_ARNS         IAM ARNs that get cluster-admin on the EKS cluster
+#   ORDERFLOW_NOTIFY_EMAIL       (optional) e-mail subscribed to the SNS topic
+#
+# RUNNERS: the container images are built for linux/arm64 (Graviton). We therefore use GitLab.com's
+# native ARM runners (fast). On an x86 runner replace the tag below and add, to `.docker-job` before_script:
+#     - docker run --privileged --rm tonistiigi/binfmt --install arm64
+# (QEMU emulation: works but the image build is several times slower.)
+# =============================================================================
+
+stages: [validate, dev, qa, prod]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+variables:
+  CDK_DEFAULT_REGION: us-east-1
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"
+  NPM_CONFIG_UPDATE_NOTIFIER: "false"
+
+default:
+  image: node:22-bookworm
+  tags: [saas-linux-small-arm64]
+  cache:
+    key:
+      files: [infra/package-lock.json]
+    paths: [.npm/]
+
+# ---------------------------------------------------------------------------
+# Reusable building blocks (names starting with "." are templates, not jobs)
+# ---------------------------------------------------------------------------
+
+# A job that talks to AWS: has an OIDC token and the AWS CLI.
+.aws-job:
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com          # must equal `audience` in infra/lib/config/gitlab.config.ts
+  before_script:
+    - bash ci/install-tools.sh
+
+# A job that also BUILDS CONTAINER IMAGES (cdk deploy): needs a Docker CLI + the docker:dind daemon.
+.docker-job:
+  extends: .aws-job
+  services:
+    - name: docker:27-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    INSTALL_DOCKER: "1"
+
+# deploy template: STAGE is set by each concrete job.
+.deploy:
+  extends: .docker-job
+  timeout: 90m                          # first deploy of EKS + Transit Gateway takes 25-35 min
+  script:
+    - cd infra && npm ci --no-audit --no-fund
+    - source ../ci/aws-auth.sh "$STAGE"
+    - npx cdk deploy "$STAGE/*" -c stage="$STAGE" --require-approval never --concurrency 3 --outputs-file "../cdk-outputs-$STAGE.json"
+  artifacts:
+    paths: ["cdk-outputs-$STAGE.json"]
+    expire_in: 1 week
+
+# smoke test template.
+.smoke:
+  extends: .aws-job
+  script:
+    - source ci/aws-auth.sh "$STAGE"
+    - ./scripts/smoke-test.sh "$STAGE"
+
+# ---------------------------------------------------------------------------
+# validate: needs NO AWS credentials (synthesis is offline, see infra/bin/app.ts)
+# ---------------------------------------------------------------------------
+validate:
+  stage: validate
+  script:
+    - cd infra && npm ci --no-audit --no-fund
+    - npx tsc --noEmit
+    - python3 -m py_compile ../apps/lambdas/*/handler.py ../apps/service/app/main.py
+    - for s in dev qa prod; do npx cdk synth "$s/*" -c stage="$s" --quiet; done
+  # cdk.out is large and reproducible: do not keep it.
+
+# Merge request only: show what WOULD change in dev. Read-only.
+diff-dev:
+  stage: validate
+  extends: .aws-job
+  variables:
+    STAGE: dev
+  script:
+    - cd infra && npm ci --no-audit --no-fund
+    - source ../ci/aws-auth.sh "$STAGE"
+    - npx cdk diff "$STAGE/*" -c stage="$STAGE"
+  allow_failure: true                   # a diff is information, not a gate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ---------------------------------------------------------------------------
+# dev: automatic on the default branch
+# ---------------------------------------------------------------------------
+deploy-dev:
+  stage: dev
+  extends: .deploy
+  needs: [validate]
+  variables:
+    STAGE: dev
+  resource_group: orderflow-dev               # never two dev deployments at the same time
+  environment:
+    name: dev
+    deployment_tier: development
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+test-dev:
+  stage: dev
+  extends: .smoke
+  needs: [deploy-dev]
+  variables:
+    STAGE: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---------------------------------------------------------------------------
+# qa: waits for a human (allow_failure: false => the pipeline BLOCKS until someone clicks "run")
+# ---------------------------------------------------------------------------
+deploy-qa:
+  stage: qa
+  extends: .deploy
+  needs: [test-dev]
+  variables:
+    STAGE: qa
+  resource_group: orderflow-qa
+  environment:
+    name: qa
+    deployment_tier: staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+
+test-qa:
+  stage: qa
+  extends: .smoke
+  needs: [deploy-qa]
+  variables:
+    STAGE: qa
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---------------------------------------------------------------------------
+# prod: waits for a human. Protect the `prod` environment in GitLab to require approvers.
+# ---------------------------------------------------------------------------
+deploy-prod:
+  stage: prod
+  extends: .deploy
+  needs: [test-qa]
+  variables:
+    STAGE: prod
+  resource_group: orderflow-prod
+  environment:
+    name: prod
+    deployment_tier: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+
+# Read-only: the smoke test creates orders, which we do not want in production.
+verify-prod:
+  stage: prod
+  extends: .aws-job
+  needs: [deploy-prod]
+  variables:
+    STAGE: prod
+  script:
+    - source ci/aws-auth.sh "$STAGE"
+    - ./scripts/health-check.sh "$STAGE"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
